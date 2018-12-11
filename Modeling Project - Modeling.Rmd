@@ -1,5 +1,5 @@
 ---
-title: "Milliman Modeling Project - Data Prep"
+title: "Modeling Project - Data Prep"
 author: "Sam Castillo"
 date: "`r format(Sys.time(), '%d %B %Y')`"
 output:
