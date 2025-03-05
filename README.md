@@ -81,10 +81,10 @@ h2o.init()
 2. **Install `h2o` in R** (`install.packages("h2o")`).
 3. **Run `h2o.init()`** to start the `h2o` engine.
 
-🚀 **Now you can run your Shiny app!** Let me know if anything goes wrong.
+
 ---
 
-## Solution: R Shiny App Files
+## R Shiny App Files
 
 ### `ui.R`
 This file defines the user interface of the Shiny app.
