@@ -43,128 +43,190 @@ library(ExamPAData)
 library(caret)
 library(dplyr)
 library(ggplot2)
+library(h2o)
 
-# Predefined list of datasets with problem type and target variable
+# Map each dataset to its target variable
 dataset_info <- list(
-  customer_phone_calls = list(type = "classification", target = "call"),
-  patient_length_of_stay = list(type = "regression", target = "length_of_stay"),
-  patient_num_labs = list(type = "regression", target = "num_labs"),
-  actuary_salaries = list(type = "regression", target = "salary"),
-  june_pa = list(type = "regression", target = "claim_amount"),
-  customer_value = list(type = "regression", target = "value"),
-  exam_pa_titanic = list(type = "classification", target = "survived"),
-  apartment_apps = list(type = "classification", target = "approved"),
-  health_insurance = list(type = "regression", target = "charges"),
-  student_success = list(type = "classification", target = "success"),
-  readmission = list(type = "classification", target = "readmitted"),
-  auto_claim = list(type = "regression", target = "claim_amount"),
-  boston = list(type = "regression", target = "price"),
-  bank_loans = list(type = "classification", target = "default")
+  customer_phone_calls  = list(type = "classification", target = "purchase"),
+  patient_length_of_stay= list(type = "regression",    target = "days"),
+  patient_num_labs      = list(type = "regression",    target = "num_labs"),
+  actuary_salaries      = list(type = "regression",    target = "salary"),
+  june_pa               = list(type = "regression",    target = "CLM_AMT"),
+  customer_value        = list(type = "regression",    target = "score"),
+  exam_pa_titanic       = list(type = "classification",target = "survived"),
+  apartment_apps        = list(type = "classification",target = "apartment_apps"),
+  health_insurance      = list(type = "regression",    target = "charges"),
+  student_success       = list(type = "classification",target = "G3"),
+  readmission           = list(type = "classification",target = "Readmission.Status"),
+  auto_claim            = list(type = "regression",    target = "CLM_AMT"),
+  boston                = list(type = "regression",    target = "medv"),
+  bank_loans            = list(type = "classification",target = "y")
 )
 
-server <- function(input, output, session) {
+shinyServer(function(input, output, session) {
+  
+  # Initialize H2O cluster
+  h2o.init(nthreads = -1, enable_assertions = FALSE)
+  
+  # When session ends, shut down H2O
+  session$onSessionEnded(function() {
+    h2o.shutdown(prompt = FALSE)
+  })
   
   # Reactive expression to load the selected dataset
   selected_data <- reactive({
-    data(list = input$dataset, package = "ExamPAData")
-    get(input$dataset)
-  })
-  
-  # Update model choices based on the problem type
-  observe({
-    problem_type <- dataset_info[[input$dataset]]$type
-    if (problem_type == "regression") {
-      updateSelectInput(session, "model", choices = c("Linear Regression", "Random Forest"))
-    } else {
-      updateSelectInput(session, "model", choices = c("Logistic Regression", "Random Forest"))
+    req(input$dataset)
+    # Load dataset from ExamPAData
+    data(list = input$dataset, package = "ExamPAData", envir = .GlobalEnv)
+    dataset <- get(input$dataset, envir = .GlobalEnv)
+    
+    # Validate dataset
+    validate(
+      need(!is.null(dataset) && nrow(dataset) > 0,
+           paste("Error: Dataset", input$dataset, "is empty or invalid."))
+    )
+    
+    # Make sure target variable exists
+    target <- dataset_info[[input$dataset]]$target
+    validate(
+      need(target %in% names(dataset),
+           paste("Error: Target variable", target, "not found in dataset."))
+    )
+    
+    # Convert classification target to factor
+    if (dataset_info[[input$dataset]]$type == "classification") {
+      dataset[[target]] <- as.factor(dataset[[target]])
     }
+    
+    dataset
   })
   
-  # Reactive expression to train the model
-  model_fit <- reactive({
-    data <- selected_data()
+  # Show target var info
+  output$targetInfo <- renderUI({
+    req(input$dataset)
+    target_name <- dataset_info[[input$dataset]]$target
+    problem_type <- dataset_info[[input$dataset]]$type
+    strong(paste("Target variable:", target_name, "(",
+                 ifelse(problem_type=="classification","classification","regression"), ")"))
+  })
+  
+  # Data preview
+  output$dataPreview <- renderTable({
+    head(selected_data(), 10)
+  })
+  
+  # Data summary
+  output$dataSummary <- renderPrint({
+    summary(selected_data())
+  })
+  
+  # Update predictor choices whenever a dataset is selected
+  observeEvent(input$dataset, {
+    df <- selected_data()
+    target <- dataset_info[[input$dataset]]$target
+    # By default, set all columns except the target as predictors
+    predictor_choices <- setdiff(names(df), target)
+    updateSelectInput(session, "predictors",
+                      choices = predictor_choices,
+                      selected = predictor_choices)
+  })
+  
+  # Compute baseline (benchmark) metric
+  # Classification -> majority class accuracy
+  # Regression -> RMSE using mean of target
+  output$baselineMetric <- renderPrint({
+    req(selected_data())
+    df <- selected_data()
     target <- dataset_info[[input$dataset]]$target
     problem_type <- dataset_info[[input$dataset]]$type
     
-    # Split data into training and testing sets
-    set.seed(123)
-    train_index <- createDataPartition(data[[target]], p = 0.8, list = FALSE)
-    train_data <- data[train_index, ]
-    test_data <- data[-train_index, ]
-    
-    # Define formula
-    formula <- as.formula(paste(target, "~ ."))
-    
-    # Train model based on selected model and problem type
-    if (input$model == "Linear Regression" && problem_type == "regression") {
-      train(formula, data = train_data, method = "lm")
-    } else if (input$model == "Logistic Regression" && problem_type == "classification") {
-      train(formula, data = train_data, method = "glm", family = "binomial")
-    } else if (input$model == "Random Forest") {
-      train(formula, data = train_data, method = "rf")
+    if (problem_type == "classification") {
+      # majority class accuracy
+      tbl <- table(df[[target]])
+      majority_class <- names(tbl)[which.max(tbl)]
+      baseline_preds <- rep(majority_class, nrow(df))
+      actual <- as.character(df[[target]])
+      acc <- mean(baseline_preds == actual)
+      cat("Baseline (majority class) accuracy =", round(acc, 4))
+    } else {
+      # regression -> mean of target
+      actual <- df[[target]]
+      mu <- mean(actual, na.rm = TRUE)
+      baseline_preds <- rep(mu, length(actual))
+      rmse <- sqrt(mean((actual - baseline_preds)^2, na.rm = TRUE))
+      cat("Baseline (mean) RMSE =", round(rmse, 4))
     }
   })
   
-  # Calculate and display performance metrics
-  output$metrics <- renderPrint({
-    data <- selected_data()
+  # Train H2O AutoML with limited algorithms
+  observeEvent(input$trainModel, {
+    # Show immediate message
+    output$trainLog <- renderText("Starting H2O AutoML training...")
+    
+    df <- selected_data()
     target <- dataset_info[[input$dataset]]$target
     problem_type <- dataset_info[[input$dataset]]$type
     
-    # Split data into training and testing sets
-    set.seed(123)
-    train_index <- createDataPartition(data[[target]], p = 0.8, list = FALSE)
-    test_data <- data[-train_index, ]
+    # partition data into train/test or just use all for demonstration
+    # For speed, let's train on all data, but normally you'd do a split
+    # ...
     
-    # Predict on test data
-    predictions <- predict(model_fit(), newdata = test_data)
+    # convert to H2O frame
+    h2o_df <- as.h2o(df)
     
-    if (problem_type == "regression") {
-      # Calculate RMSE and R-squared
-      rmse <- sqrt(mean((test_data[[target]] - predictions)^2))
-      r_squared <- cor(test_data[[target]], predictions)^2
-      cat("RMSE:", rmse, "\nR-squared:", r_squared)
-    } else {
-      # Calculate accuracy
-      if (is.factor(test_data[[target]])) {
-        test_data[[target]] <- as.factor(test_data[[target]])
-        predictions <- factor(predictions, levels = levels(test_data[[target]]))
-      }
-      confusion <- confusionMatrix(predictions, test_data[[target]])
-      cat("Accuracy:", confusion$overall['Accuracy'])
+    # ensure the target is factor for classification
+    if (problem_type == "classification") {
+      h2o_df[[target]] <- h2o.asfactor(h2o_df[[target]])
     }
-  })
-  
-  # Generate visualization
-  output$plot <- renderPlot({
-    data <- selected_data()
-    target <- dataset_info[[input$dataset]]$target
-    problem_type <- dataset_info[[input$dataset]]$type
     
-    # Split data into training and testing sets
-    set.seed(123)
-    train_index <- createDataPartition(data[[target]], p = 0.8, list = FALSE)
-    test_data <- data[-train_index, ]
-    
-    # Predict on test data
-    predictions <- predict(model_fit(), newdata = test_data)
-    
-    if (problem_type == "regression") {
-      # Scatter plot of actual vs predicted
-      ggplot(test_data, aes(x = .data[[target]], y = predictions)) +
-        geom_point() +
-        geom_abline(slope = 1, intercept = 0, color = "red") +
-        labs(x = "Actual", y = "Predicted", title = "Actual vs Predicted")
-    } else {
-      # Confusion matrix heatmap
-      confusion <- confusionMatrix(predictions, test_data[[target]])
-      ggplot(data = as.data.frame(confusion$table), aes(x = Reference, y = Prediction, fill = Freq)) +
-        geom_tile() +
-        scale_fill_gradient(low = "white", high = "blue") +
-        labs(title = "Confusion Matrix")
+    # set predictor variables
+    predictors <- input$predictors
+    if (length(predictors) < 1) {
+      # fallback if none selected
+      predictors <- setdiff(names(df), target)
     }
+    
+    # For speed, let's exclude most algorithms
+    # We'll only allow DRF (Random Forest) and GBM
+    # Also reduce cross-validation folds and set a small max_models
+    captured_log <- capture.output({
+      aml <- h2o.automl(
+        x = predictors,
+        y = target,
+        training_frame = h2o_df,
+        include_algos = c("DRF","GBM"),    # Limit to 2 algorithms
+        max_models = 5,                   # limit number of models
+        nfolds = 2,                       # fewer folds for speed
+        seed = 42,
+        sort_metric = ifelse(problem_type=="classification","AUC","RMSE"),
+        keep_cross_validation_predictions = FALSE,
+        keep_cross_validation_models = FALSE,
+        keep_cross_validation_fold_assignment = FALSE
+      )
+      
+      # store the leader for performance
+      leader <- aml@leader
+      perf <- h2o.performance(leader, h2o_df)  # evaluate on same data (demo)
+      
+      # Print summary so it appears in the captured log
+      print(aml@leaderboard)
+      cat("\n--- Leader Model Summary ---\n")
+      print(leader)
+      cat("\n--- Performance on training data: ---\n")
+      print(perf)
+    })
+    
+    # Render progress/log in UI
+    output$trainLog <- renderText(paste(captured_log, collapse = "\n"))
+    
+    # Render final performance metrics in a separate output for clarity
+    output$perfMetrics <- renderPrint({
+      # optional final summary
+      cat("Final Model Performance (see log above for details).")
+    })
   })
-}
+})
+
 ```
 
 ---
